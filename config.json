@@ -1,0 +1,25 @@
+{
+  "excel": "Viscose Benchmarks Beta.xlsx",
+  "csv_paths": [
+    "~/.steam/steam/steamapps/common/FPSAimTrainer/FPSAimTrainer/stats"
+  ],
+  "csv_pattern": "*.csv",
+  "csv_delimiter": ",",
+  "sheets": [
+    "Easier Scenarios",
+    "Medium Scenarios",
+    "Hard Scenarios"
+  ],
+  "table": "scenario_scores",
+  "name_column": "scenarioName",
+  "score_column": "totalScore",
+  "output": "Viscose Benchmarks Updated.xlsx",
+  "watch": {
+    "paths": [
+      "C:/Program Files (x86)/Steam/steamapps/common/KovaaKs FPS Aim Trainer/stats",
+      "~/.steam/steam/steamapps/common/FPSAimTrainer/FPSAimTrainer/stats"
+    ],
+    "debounce_seconds": 3,
+    "run_on_start": true
+  }
+}

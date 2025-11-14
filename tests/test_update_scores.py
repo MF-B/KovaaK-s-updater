@@ -98,6 +98,21 @@ class UpdateScoresTestCase(unittest.TestCase):
         scores = update_scores.fetch_scores_from_csv([csv_file])
         self.assertEqual(scores[update_scores.normalize_key("Whisphere 80%")], 3180.0)
 
+    def test_csv_with_table_but_no_scenario_column(self):
+        csv_file = self.tmp_path / "table_meta.csv"
+        csv_file.write_text(
+            "Kill #,Shots,Hits\n"
+            "1,10,8\n"
+            "2,12,9\n\n"
+            "Score:,1234.5\n"
+            "Scenario:,Metadata Map\n",
+            encoding="utf-8",
+        )
+
+        scores = update_scores.fetch_scores_from_csv([csv_file])
+        key = update_scores.normalize_key("Metadata Map")
+        self.assertEqual(scores[key], 1234.5)
+
     def test_update_sheet_with_formula_headers(self):
         wb = Workbook()
         ws = wb.active
@@ -118,6 +133,79 @@ class UpdateScoresTestCase(unittest.TestCase):
         self.assertEqual(stats.updated, 2)
         self.assertEqual(ws.cell(row=2, column=5).value, 4000)
         self.assertEqual(ws.cell(row=3, column=5).value, 1700)
+
+    def test_update_sheet_with_formula_scenario_values(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Formula Scenario"
+        ws.cell(row=1, column=3, value="Scenario")
+        ws.cell(row=1, column=5, value="High Score")
+        ws.cell(row=2, column=3, value='=IFERROR(__xludf.DummyFunction("""source"""),"Whisphere 80%")')
+        ws.cell(row=3, column=3, value='=IFERROR(__xludf.DummyFunction("""source"""),"Controlsphere rAim Easy 90%")')
+
+        stats = update_scores.update_sheet(
+            ws,
+            {
+                update_scores.normalize_key("Whisphere 80%"   ): 3180,
+                update_scores.normalize_key("Controlsphere rAim Easy 90%"   ): 3261,
+            },
+        )
+
+        self.assertEqual(stats.updated, 2)
+        self.assertEqual(ws.cell(row=2, column=5).value, 3180)
+        self.assertEqual(ws.cell(row=3, column=5).value, 3261)
+
+    def test_update_sheet_with_merged_high_score_columns(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Merged High Score"
+        ws.cell(row=1, column=3, value="Scenario")
+        ws.merge_cells(start_row=1, start_column=5, end_row=1, end_column=6)
+        ws.cell(row=1, column=5, value="High Score")
+        ws.column_dimensions["E"].width = 15
+        ws.column_dimensions["F"].width = 25
+        ws.cell(row=2, column=3, value="Whisphere 80%")
+        ws.cell(row=3, column=3, value="Controlsphere rAim Easy 90%")
+
+        stats = update_scores.update_sheet(
+            ws,
+            {
+                update_scores.normalize_key("Whisphere 80%"   ): 3180,
+                update_scores.normalize_key("Controlsphere rAim Easy 90%"   ): 3261,
+            },
+        )
+
+        self.assertEqual(stats.updated, 2)
+        self.assertIsNone(ws.cell(row=2, column=5).value)
+        self.assertEqual(ws.cell(row=2, column=6).value, 3180)
+        self.assertIsNone(ws.cell(row=3, column=5).value)
+        self.assertEqual(ws.cell(row=3, column=6).value, 3261)
+
+    def test_update_sheet_prefers_rightmost_when_equal_width(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Equal Width"
+        ws.cell(row=1, column=3, value="Scenario")
+        ws.merge_cells(start_row=1, start_column=5, end_row=1, end_column=6)
+        ws.cell(row=1, column=5, value="High Score")
+        ws.column_dimensions["E"].width = 20
+        ws.column_dimensions["F"].width = 20
+        ws.cell(row=2, column=3, value="Scenario A")
+        ws.cell(row=3, column=3, value="Scenario B")
+        ws.cell(row=3, column=5, value=999)
+
+        stats = update_scores.update_sheet(
+            ws,
+            {
+                update_scores.normalize_key("Scenario A"): 111,
+                update_scores.normalize_key("Scenario B"): 222,
+            },
+        )
+
+        self.assertEqual(stats.updated, 2)
+        self.assertEqual(ws.cell(row=2, column=6).value, 111)
+        # 第二行的列 E 已有值，因此应当 fallback 到列 F
+        self.assertEqual(ws.cell(row=3, column=6).value, 222)
 
 
 if __name__ == "__main__":

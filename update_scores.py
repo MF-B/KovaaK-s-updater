@@ -10,12 +10,13 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import json
 import logging
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     import pandas as pd  # Optional, used for pretty console summaries.
@@ -23,6 +24,7 @@ except ImportError:  # pragma: no cover - pandas is optional but recommended.
     pd = None  # type: ignore
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 LOGGER = logging.getLogger("kovaak_updater")
@@ -64,7 +66,11 @@ class TableSelection:
 class SheetHeader:
     header_row: int
     scenario_col: int
-    high_score_col: int
+    high_score_cols: List[int]
+
+    @property
+    def primary_high_score_col(self) -> int:
+        return self.high_score_cols[0]
 
 
 @dataclass
@@ -74,12 +80,35 @@ class SheetUpdateStats:
     missing: List[str]
 
 
+@dataclass
+class UpdateSettings:
+    excel: Path = Path("Viscose Benchmarks Beta.xlsx")
+    stats_db: Optional[Path] = None
+    csv_paths: List[Path] = field(default_factory=list)
+    csv_pattern: str = "*.csv"
+    csv_delimiter: str = ","
+    sheets: Optional[List[str]] = None
+    table: Optional[str] = None
+    name_column: Optional[str] = None
+    score_column: Optional[str] = None
+    output: Optional[Path] = None
+    dry_run: bool = False
+
+
+@dataclass
+class WatchSettings:
+    paths: List[Path] = field(default_factory=list)
+    debounce_seconds: float = 2.0
+    run_on_start: bool = True
+
+
 def normalize_key(value: str) -> str:
     clean = " ".join(value.split())
     return clean.strip().lower()
 
 
 QUOTED_TEXT_PATTERN = re.compile(r'"([^\"]+)"')
+DEFAULT_EXCEL_COLUMN_WIDTH = 8.43
 
 
 def extract_header_text(value) -> Optional[str]:
@@ -102,6 +131,78 @@ def extract_header_text(value) -> Optional[str]:
     return text.lower() if text else None
 
 
+def extract_cell_text(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        text = str(value)
+    else:
+        text = str(value).strip()
+    if not text:
+        return None
+    if text.startswith("="):
+        literals: List[str] = []
+        current: List[str] = []
+        in_literal = False
+        i = 0
+        while i < len(text):
+            char = text[i]
+            if char == '"':
+                if in_literal:
+                    next_char = text[i + 1] if i + 1 < len(text) else None
+                    if next_char == '"':
+                        current.append('"')
+                        i += 2
+                        continue
+                    literals.append("".join(current))
+                    current = []
+                    in_literal = False
+                else:
+                    in_literal = True
+                i += 1
+                continue
+            if in_literal:
+                current.append(char)
+            i += 1
+        if current and in_literal:
+            literals.append("".join(current))
+        if literals:
+            text = literals[-1]
+        else:
+            text = text.lstrip("=")
+    text = text.strip()
+    return text or None
+
+
+def resolve_high_score_columns(ws: Worksheet, header_row: int, base_col: int) -> List[int]:
+    for merged_range in ws.merged_cells.ranges:
+        if (
+            merged_range.min_row <= header_row <= merged_range.max_row
+            and merged_range.min_col <= base_col <= merged_range.max_col
+        ):
+            return list(range(merged_range.min_col, merged_range.max_col + 1))
+    return [base_col]
+
+
+def choose_high_score_column(ws: Worksheet, candidate_cols: Sequence[int], row_idx: int) -> Optional[int]:
+    best_col = None
+    best_width = -1.0
+    for col in candidate_cols:
+        cell = ws.cell(row=row_idx, column=col)
+        value = cell.value
+        if value not in (None, ""):
+            continue
+        letter = get_column_letter(col)
+        dimension = ws.column_dimensions.get(letter)
+        width = dimension.width if dimension and dimension.width is not None else DEFAULT_EXCEL_COLUMN_WIDTH
+        if width > best_width or (width == best_width and (best_col is None or col > best_col)):
+            best_col = col
+            best_width = width
+    if best_col is not None:
+        return best_col
+    return max(candidate_cols) if candidate_cols else None
+
+
 def quote_identifier(identifier: str) -> str:
     escaped = identifier.replace('"', '""')
     return f'"{escaped}"'
@@ -109,6 +210,164 @@ def quote_identifier(identifier: str) -> str:
 
 def list_existing_stats_dirs() -> List[Path]:
     return [path for path in DEFAULT_STATS_DIRS if path.exists()]
+
+
+def resolve_config_path(value: str, base_dir: Path) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = (base_dir / path).resolve()
+    return path
+
+
+def ensure_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def apply_update_settings_from_dict(settings: UpdateSettings, data: Dict[str, Any], base_dir: Path) -> None:
+    if "excel" in data:
+        settings.excel = resolve_config_path(data["excel"], base_dir)
+    if "stats_db" in data:
+        stats_value = data["stats_db"]
+        settings.stats_db = resolve_config_path(stats_value, base_dir) if stats_value else None
+    if "csv_paths" in data:
+        settings.csv_paths = [resolve_config_path(item, base_dir) for item in ensure_list(data["csv_paths"])]
+    if "csv_pattern" in data:
+        settings.csv_pattern = str(data["csv_pattern"])
+    if "csv_delimiter" in data:
+        settings.csv_delimiter = str(data["csv_delimiter"])
+    if "sheets" in data:
+        settings.sheets = [str(item) for item in ensure_list(data["sheets"])]
+    if "table" in data:
+        settings.table = data["table"] or None
+    if "name_column" in data:
+        settings.name_column = data["name_column"] or None
+    if "score_column" in data:
+        settings.score_column = data["score_column"] or None
+    if "output" in data:
+        output_value = data["output"]
+        settings.output = resolve_config_path(output_value, base_dir) if output_value else None
+    if "dry_run" in data:
+        settings.dry_run = bool(data["dry_run"])
+
+
+def apply_watch_settings_from_dict(watch: WatchSettings, data: Dict[str, Any], base_dir: Path) -> None:
+    if "paths" in data:
+        watch.paths = [resolve_config_path(item, base_dir) for item in ensure_list(data["paths"])]
+    if "debounce_seconds" in data:
+        watch.debounce_seconds = float(data["debounce_seconds"])
+    if "run_on_start" in data:
+        watch.run_on_start = bool(data["run_on_start"])
+
+
+def discover_config_path(cli_path: Optional[Path]) -> Optional[Path]:
+    if cli_path:
+        return cli_path.expanduser().resolve()
+    default_path = Path("config.json")
+    if default_path.exists():
+        return default_path.resolve()
+    return None
+
+
+def load_settings_from_config(
+    config_path: Optional[Path],
+) -> Tuple[Optional[UpdateSettings], Optional[WatchSettings]]:
+    if config_path is None:
+        return None, None
+    config_path = config_path.expanduser().resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"未找到配置文件: {config_path}")
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    base_dir = config_path.parent
+    settings = UpdateSettings()
+    apply_update_settings_from_dict(settings, data, base_dir)
+    watch_settings = None
+    if isinstance(data.get("watch"), dict):
+        watch_settings = WatchSettings()
+        apply_watch_settings_from_dict(watch_settings, data["watch"], base_dir)
+    return settings, watch_settings
+
+
+def merge_settings(base_settings: Optional[UpdateSettings], args: argparse.Namespace) -> UpdateSettings:
+    settings = UpdateSettings()
+    if base_settings:
+        settings = UpdateSettings(
+            excel=base_settings.excel,
+            stats_db=base_settings.stats_db,
+            csv_paths=list(base_settings.csv_paths),
+            csv_pattern=base_settings.csv_pattern,
+            csv_delimiter=base_settings.csv_delimiter,
+            sheets=list(base_settings.sheets) if base_settings.sheets else None,
+            table=base_settings.table,
+            name_column=base_settings.name_column,
+            score_column=base_settings.score_column,
+            output=base_settings.output,
+            dry_run=base_settings.dry_run,
+        )
+
+    def _maybe_path(value: Optional[Path]) -> Optional[Path]:
+        if value is None:
+            return None
+        return value.expanduser().resolve()
+
+    if args.excel:
+        settings.excel = _maybe_path(args.excel) or settings.excel
+    if args.db:
+        settings.stats_db = _maybe_path(args.db)
+    if args.csv:
+        for csv_entry in args.csv:
+            resolved_csv = _maybe_path(csv_entry)
+            if resolved_csv:
+                settings.csv_paths.append(resolved_csv)
+    if args.csv_pattern:
+        settings.csv_pattern = args.csv_pattern
+    if args.csv_delimiter:
+        settings.csv_delimiter = args.csv_delimiter
+    if args.sheets:
+        settings.sheets = args.sheets
+    if args.table:
+        settings.table = args.table
+    if args.name_column:
+        settings.name_column = args.name_column
+    if args.score_column:
+        settings.score_column = args.score_column
+    if args.output:
+        settings.output = _maybe_path(args.output)
+    if args.dry_run:
+        settings.dry_run = True
+
+    if not settings.csv_paths:
+        settings.csv_paths = []
+
+    return settings
+
+
+def prepare_watch_settings(
+    update_settings: UpdateSettings,
+    watch_settings: Optional[WatchSettings],
+) -> WatchSettings:
+    settings = WatchSettings()
+    if watch_settings:
+        settings.paths = [path.expanduser().resolve() for path in watch_settings.paths]
+        settings.debounce_seconds = watch_settings.debounce_seconds
+        settings.run_on_start = watch_settings.run_on_start
+
+    if not settings.paths:
+        derived_paths: List[Path] = []
+        if update_settings.stats_db:
+            derived_paths.append(update_settings.stats_db)
+        derived_paths.extend(update_settings.csv_paths)
+        if not derived_paths:
+            derived_paths.extend(list_existing_stats_dirs())
+        settings.paths = [path.expanduser().resolve() for path in derived_paths if path]
+
+    return settings
 
 
 def detect_table(conn: sqlite3.Connection) -> Optional[TableSelection]:
@@ -306,18 +565,23 @@ def fetch_scores_from_csv(
         plain_rows = list(csv.reader(io.StringIO(raw_text), delimiter=delimiter))
 
         fallback_name = csv_path.stem
+        metadata_result = extract_key_value_score(plain_rows, fallback_name)
+        metadata_present = metadata_result is not None
         updated_rows = 0
 
         scenario_col, score_col = detect_csv_columns(headers)
         if score_col is None and rows:
             score_col = select_numeric_column(rows, headers)
 
-        if score_col is not None and rows:
+        can_use_table = scenario_col is not None and score_col is not None and rows
+        if can_use_table:
             for row in rows:
-                scenario_value = row.get(scenario_col) if scenario_col else fallback_name
+                scenario_value = row.get(scenario_col)
                 if scenario_value is None:
-                    scenario_value = fallback_name
-                scenario_name = str(scenario_value).strip() or fallback_name
+                    continue
+                scenario_name = str(scenario_value).strip()
+                if not scenario_name:
+                    continue
 
                 raw_score = row.get(score_col)
                 score_value = try_parse_float(raw_score) if raw_score is not None else None
@@ -329,27 +593,20 @@ def fetch_scores_from_csv(
                 if previous is None or score_value > previous:
                     aggregated[key] = score_value
                     updated_rows += 1
-            if updated_rows == 0:
-                kv_result = extract_key_value_score(plain_rows, fallback_name)
-                if kv_result:
-                    scenario_name, score_value = kv_result
-                    key = normalize_key(scenario_name)
-                    previous = aggregated.get(key)
-                    if previous is None or score_value > previous:
-                        aggregated[key] = score_value
-                        updated_rows += 1
-        else:
-            kv_result = extract_key_value_score(plain_rows, fallback_name)
-            if kv_result:
-                scenario_name, score_value = kv_result
-                key = normalize_key(scenario_name)
-                previous = aggregated.get(key)
-                if previous is None or score_value > previous:
-                    aggregated[key] = score_value
-                    updated_rows += 1
+        elif scenario_col is not None and rows:
+            LOGGER.debug("CSV %s 检测到场景列但缺少分数字段，已跳过表格数据。", csv_path.name)
 
-        if updated_rows:
-            LOGGER.debug("解析 CSV %s -> 记录 %d 条", csv_path.name, updated_rows)
+        if metadata_result:
+            scenario_name, score_value = metadata_result
+            key = normalize_key(scenario_name)
+            previous = aggregated.get(key)
+            if previous is None or score_value > previous:
+                aggregated[key] = score_value
+                updated_rows += 1
+
+        if updated_rows or metadata_present:
+            extra = " + 元数据" if metadata_present else ""
+            LOGGER.debug("解析 CSV %s -> 记录 %d 条%s", csv_path.name, updated_rows, extra)
         else:
             LOGGER.warning("CSV %s 未找到有效的场景/分数记录，已跳过。", csv_path)
 
@@ -378,7 +635,8 @@ def detect_header(ws: Worksheet) -> Optional[SheetHeader]:
                 high_score_col = cell.column
                 header_row = header_row or cell.row
         if scenario_col and high_score_col:
-            return SheetHeader(header_row=header_row, scenario_col=scenario_col, high_score_col=high_score_col)
+            high_score_cols = resolve_high_score_columns(ws, header_row, high_score_col)
+            return SheetHeader(header_row=header_row, scenario_col=scenario_col, high_score_cols=high_score_cols)
 
     return None
 
@@ -393,10 +651,7 @@ def update_sheet(ws: Worksheet, scores: Dict[str, float]) -> SheetUpdateStats:
     missing: List[str] = []
     for row_idx in range(header.header_row + 1, ws.max_row + 1):
         scenario_cell = ws.cell(row=row_idx, column=header.scenario_col)
-        value = scenario_cell.value
-        if value is None:
-            continue
-        scenario_name = str(value).strip()
+        scenario_name = extract_cell_text(scenario_cell.value)
         if not scenario_name:
             continue
         normalized = normalize_key(scenario_name)
@@ -404,7 +659,11 @@ def update_sheet(ws: Worksheet, scores: Dict[str, float]) -> SheetUpdateStats:
             missing.append(scenario_name)
             continue
         score_value = scores[normalized]
-        target_cell = ws.cell(row=row_idx, column=header.high_score_col)
+        target_column = choose_high_score_column(ws, header.high_score_cols, row_idx)
+        if target_column is None:
+            LOGGER.warning("工作表 %s 找不到可写入的 High Score 列，已跳过行 %d。", ws.title, row_idx)
+            continue
+        target_cell = ws.cell(row=row_idx, column=target_column)
         target_cell.value = round(score_value, 2)
         updated += 1
 
@@ -466,13 +725,14 @@ def guess_default_db_path() -> Optional[Path]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="同步 KovaaK 高分到 Excel")
+    parser.add_argument("--config", type=Path, default=None, help="配置文件路径 (JSON)")
     parser.add_argument("--db", type=Path, default=None, help="stats.db 路径 (默认自动探测常见路径)")
-    parser.add_argument("--excel", type=Path, default=Path("Viscose Benchmarks Beta.xlsx"), help="Excel 文件路径")
+    parser.add_argument("--excel", type=Path, default=None, help="Excel 文件路径")
     parser.add_argument("--output", type=Path, default=None, help="保存为新文件的路径 (默认原地覆盖)")
-    parser.add_argument("--sheets", nargs="*", help="需要更新的工作表名称 (默认自动选择包含 Scenarios 的工作表)")
-    parser.add_argument("--csv", nargs="*", type=Path, help="CSV 文件或目录，用于在缺少 stats.db 时提供分数数据")
-    parser.add_argument("--csv-pattern", default="*.csv", help="当 --csv 指向目录时使用的 glob 模式")
-    parser.add_argument("--csv-delimiter", default=",", help="CSV 文件使用的分隔符 (默认逗号)")
+    parser.add_argument("--sheets", nargs="*", default=None, help="需要更新的工作表名称 (默认自动选择包含 Scenarios 的工作表)")
+    parser.add_argument("--csv", action="append", type=Path, help="CSV 文件或目录 (可重复指定)")
+    parser.add_argument("--csv-pattern", default=None, help="当 --csv 指向目录时使用的 glob 模式")
+    parser.add_argument("--csv-delimiter", default=None, help="CSV 文件使用的分隔符 (默认逗号)")
     parser.add_argument("--table", help="数据库中包含分数的表名")
     parser.add_argument("--name-column", dest="name_column", help="场景名称列")
     parser.add_argument("--score-column", dest="score_column", help="分数列")
@@ -503,82 +763,96 @@ def render_summary(stats: Iterable[SheetUpdateStats]):
             print(f"工作表 {row['Sheet']} -> 更新 {row['Updated']} 条")
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="[%(levelname)s] %(message)s")
+def run_update(settings: UpdateSettings) -> Tuple[List[SheetUpdateStats], Path]:
+    excel_path = settings.excel.expanduser().resolve()
+    if not excel_path.exists():
+        raise FileNotFoundError(f"未找到 Excel 文件: {excel_path}")
 
-    db_path: Optional[Path] = None
-    if args.db:
-        candidate = args.db.expanduser().resolve()
-        if not candidate.exists():
-            parser.error(f"数据库路径不存在: {candidate}")
-        db_path = candidate
-    else:
+    db_path = settings.stats_db.expanduser().resolve() if settings.stats_db else None
+    if db_path and not db_path.exists():
+        raise FileNotFoundError(f"数据库路径不存在: {db_path}")
+
+    if db_path is None:
         guessed_db = guess_default_db_path()
         if guessed_db:
             db_path = guessed_db.expanduser().resolve()
             LOGGER.info("自动检测到 stats.db: %s", db_path)
 
+    csv_pattern = settings.csv_pattern or "*.csv"
     csv_files: List[Path] = []
-    csv_requested = bool(args.csv)
-    if args.csv:
-        csv_files = collect_csv_files(args.csv, pattern=args.csv_pattern)
-        if not csv_files:
-            parser.error("在 --csv 指定的路径中未找到任何 CSV 文件")
-
-    if db_path is None and not csv_files:
-        guessed_csv = guess_default_csv_files(pattern=args.csv_pattern)
-        if guessed_csv:
-            csv_files = guessed_csv
-            LOGGER.info("未找到 stats.db，改用 %d 个 CSV 文件", len(csv_files))
+    if settings.csv_paths:
+        csv_files = collect_csv_files(settings.csv_paths, pattern=csv_pattern)
+    if not csv_files:
+        csv_files = guess_default_csv_files(pattern=csv_pattern)
 
     data_source = None
-    if csv_requested and csv_files:
-        data_source = "csv"
-    elif db_path is not None:
+    if db_path and db_path.exists():
         data_source = "db"
     elif csv_files:
         data_source = "csv"
-    else:
-        parser.error("未能找到 stats.db，也没有可用的 CSV 文件。请使用 --db 或 --csv 指定数据来源。")
 
-    excel_path = args.excel.expanduser().resolve()
-    if not excel_path.exists():
-        parser.error(f"未找到 Excel 文件: {excel_path}")
+    if data_source is None:
+        raise RuntimeError("未能找到 stats.db，也没有可用的 CSV 文件。请在配置或命令行中提供路径。")
 
     if data_source == "db":
-        assert db_path is not None
-        scores, selection = fetch_scores_from_db(
+        scores, _selection = fetch_scores_from_db(
             db_path=db_path,
-            table=args.table,
-            name_column=args.name_column,
-            score_column=args.score_column,
+            table=settings.table,
+            name_column=settings.name_column,
+            score_column=settings.score_column,
         )
         LOGGER.info("共加载 %d 条场景分数记录 (来自 SQLite)", len(scores))
     else:
-        scores = fetch_scores_from_csv(csv_files, delimiter=args.csv_delimiter)
-        selection = None
+        delimiter = settings.csv_delimiter or ","
+        scores = fetch_scores_from_csv(csv_files, delimiter=delimiter)
         LOGGER.info("共加载 %d 条场景分数记录 (来自 CSV)", len(scores))
 
     workbook_stats, workbook = update_workbook(
         workbook_path=excel_path,
         scores=scores,
-        sheets=args.sheets,
+        sheets=settings.sheets,
     )
 
-    render_summary(workbook_stats)
-
-    if args.dry_run:
-        LOGGER.info("已启用 --dry-run，未对 Excel 进行写入。")
-        return
-
-    output_path = args.output.expanduser().resolve() if args.output else excel_path
-    if output_path == excel_path:
-        LOGGER.info("保存修改 -> %s", output_path)
+    output_path = settings.output.expanduser().resolve() if settings.output else excel_path
+    if settings.dry_run:
+        LOGGER.info("Dry-run 模式，未对 Excel 进行写入 (目标: %s)", output_path)
     else:
-        LOGGER.info("保存到新文件 -> %s", output_path)
-    workbook.save(output_path)
+        if output_path == excel_path:
+            LOGGER.info("保存修改 -> %s", output_path)
+        else:
+            LOGGER.info("保存到新文件 -> %s", output_path)
+        workbook.save(output_path)
+
+    return workbook_stats, output_path
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="[%(levelname)s] %(message)s")
+    config_path = discover_config_path(args.config)
+    if config_path:
+        LOGGER.info("使用配置文件: %s", config_path)
+    base_settings, _watch = load_settings_from_config(config_path)
+    settings = merge_settings(base_settings, args)
+
+    if args.db and settings.stats_db and not settings.stats_db.exists():
+        parser.error(f"数据库路径不存在: {settings.stats_db}")
+
+    if args.csv:
+        csv_files = collect_csv_files(settings.csv_paths, pattern=settings.csv_pattern)
+        if not csv_files:
+            parser.error("在 --csv 指定的路径中未找到任何 CSV 文件")
+
+    try:
+        workbook_stats, output_path = run_update(settings)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
+    except RuntimeError as exc:
+        LOGGER.error("更新失败: %s", exc)
+        raise SystemExit(1)
+
+    render_summary(workbook_stats)
 
 
 if __name__ == "__main__":

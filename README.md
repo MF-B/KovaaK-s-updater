@@ -1,90 +1,103 @@
-# Aim Updater – 阶段 1 (MVP)
+# Aim Updater – 阶段 2：配置化 + 监控
 
-该项目实现了一个跨平台的 Python 脚本 `update_scores.py`，用于从 KovaaK 的 `stats.db` 数据库读取每个场景的历史最高分，并把分数写入到 `Viscose Benchmarks Beta.xlsx` 中的 "High Score" 列。
+该项目提供两个工具：
+
+1. `update_scores.py` – 读取 KovaaK 的 `stats.db` 或 CSV 导出并把最高分同步到 `Viscose Benchmarks Beta.xlsx`。
+2. `watcher.pyw` – 监听 KovaaK 目录，一旦有新的成绩文件就自动调用 `update_scores` 完成同步。
+
+两者都围绕统一的 `config.json` 运行，可通过命令行参数进行临时覆盖。
 
 ## 环境准备
 
-1. 建议使用 Python 3.11 及以上版本（脚本已在 Linux 上测试，Windows 同样适用）。
-2. 安装依赖：
+- Python 3.11 或以上（在 Linux/Steam Deck + Windows 下测试）。
+- 安装依赖：
+
+  ```bash
+  python3 -m pip install -r requirements.txt
+  ```
+
+  - `openpyxl` 负责读写 Excel
+  - `pandas` 用于漂亮的终端摘要（可选）
+  - `watchdog` 为 watcher 提供跨平台文件系统事件
+
+## 配置文件（config.json）
+
+1. 复制示例：`cp config.example.json config.json`
+2. 根据实际环境修改路径。相对路径以 `config.json` 所在目录为基准。
+
+关键字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `excel` | 目标 Excel 文件。默认 `Viscose Benchmarks Beta.xlsx` 可放在仓库根目录。|
+| `stats_db` | KovaaK 的 `stats.db` 路径。缺失时会尝试 CSV。|
+| `csv_paths` / `csv_pattern` / `csv_delimiter` | 当没有数据库或希望改用 CSV 时，列出 CSV 文件或目录。|
+| `sheets` | 需要更新的工作表名称（可选，默认匹配包含 `Scenarios` 的表）。|
+| `table` / `name_column` / `score_column` | 如自动探测数据库失败，可在此强制指定。|
+| `output` | 写入新的 Excel 文件而非覆盖原文件（可选）。|
+| `watch` | Watcher 配置，包含 `paths`（监控目录/文件）、`debounce_seconds`（防抖）、`run_on_start`。|
+
+> `config.json` 不是必需的：没有配置文件时脚本会回退到旧的命令行行为，并尝试自动检测常见的 KovaaK 安装目录。
+
+## 手动同步（CLI）
 
 ```bash
-python3 -m pip install -r requirements.txt
+python3 update_scores.py --config config.json
 ```
 
-> `sqlite3` 是 Python 标准库（不需要额外安装），`openpyxl` 用于读写 Excel，`pandas` 用于在终端展示更新摘要（没有也可以运行脚本）。
+- 如果没有 `--config`，脚本会在当前目录查找 `config.json`，找不到则使用内置默认值。
+- 任意命令行参数都会覆盖配置文件中的值，例如：
 
-## KovaaK 数据源路径
+  ```bash
+  python3 update_scores.py --config config.json --excel "~/Documents/Viscose.xlsx" --dry-run
+  ```
 
-- Windows 默认路径：`C:\Program Files (x86)\Steam\steamapps\common\KovaaKs FPS Aim Trainer\stats\stats.db`
-- Linux/Steam Deck 常见路径：`~/.steam/steam/steamapps/common/KovaaKs FPS Aim Trainer/stats/stats.db`
-- Linux Proton (FPSAimTrainer) 路径：`~/.steam/steam/steamapps/common/FPSAimTrainer/FPSAimTrainer/stats`
+### CLI 参数速查
 
-如果你的安装目录中不存在 `stats.db`（例如 Linux Proton 环境只保存 CSV），脚本会自动在同一 `stats` 目录下搜索 `*.csv` 文件并改用 CSV 数据源。也可以手动指定：
-
-```bash
-python3 update_scores.py --csv "/path/to/stats/"
-```
-
-脚本会尝试自动检测这些常见路径。若自动探测失败，请通过 `--db` 手动指定。
-
-## 使用方法
-
-1. **确保 Excel 文件在仓库根目录**（或使用 `--excel` 指定其它路径）。
-2. 运行脚本：
-
-```bash
-python3 update_scores.py --db "/path/to/stats.db" --excel "Viscose Benchmarks Beta.xlsx"
-```
-
-若使用 CSV 数据源（单个文件或目录均可）：
-
-```bash
-python3 update_scores.py --csv "/path/to/stats/*.csv" --excel "Viscose Benchmarks Beta.xlsx"
-```
-
-脚本会：
-
-- 连接 SQLite 数据库，自动检测合适的数据表/列，按场景聚合最高分。
-- 遍历包含 "Scenarios" 的工作表（Easier/Medium/Hard），匹配 `Scenario` 列中的名称，与数据库中的场景名称进行大小写不敏感匹配。
-- 将匹配成功的分数写入 "High Score" 列。
-- 在终端输出每个工作表的更新统计以及无法匹配的场景。
-
-### 常用参数
-
-| 参数 | 说明 |
+| 参数 | 作用 |
 | ---- | ---- |
-| `--db` | stats.db 路径。若省略则尝试自动探测常见路径。 |
-| `--csv` | 一个或多个 CSV 文件/目录路径（支持通配符所在目录），在缺少 `stats.db` 时作为数据源。 |
-| `--csv-pattern` | 当 `--csv` 指向目录时用于匹配文件的 glob，默认 `*.csv`。 |
-| `--csv-delimiter` | CSV 的分隔符，默认逗号。 |
-| `--excel` | Excel 文件路径，默认 `Viscose Benchmarks Beta.xlsx`。 |
-| `--output` | 将结果写入新的文件而不是覆盖原文件。 |
-| `--sheets` | 指定需要更新的工作表名称，默认匹配名称里包含 `Scenarios` 的工作表。 |
-| `--table` / `--name-column` / `--score-column` | 如果自动检测数据库结构失败，可用此三项明确指定 SQL 表与列。 |
-| `--dry-run` | 只查看匹配结果，不写入 Excel。 |
-| `--verbose` | 输出调试日志，方便定位问题。 |
+| `--config` | 指定配置文件（默认寻找 `./config.json`）。|
+| `--excel` / `--db` / `--csv` 等 | 与配置字段同名，可即时覆盖。|
+| `--output` | 输出到新的 Excel。|
+| `--dry-run` | 不落盘，仅输出日志。|
+| `--verbose` | 输出调试日志。|
 
-### 示例
+脚本会自动：
+
+1. 选取数据库或 CSV 作为数据源（优先数据库）。
+2. 为每个场景挑选最高分，匹配 Excel 中的 `Scenario` 列。
+3. 更新 `High Score` 列，并在终端打印每个工作表的更新统计。
+
+## 自动同步（watcher）
+
+Watcher 会监视 `watch.paths` 中的目录/文件，只要有修改就调用一次 `update_scores`。
 
 ```bash
-python3 update_scores.py \
-  --db "C:/Program Files (x86)/Steam/steamapps/common/KovaaKs FPS Aim Trainer/stats/stats.db" \
-  --excel "Viscose Benchmarks Beta.xlsx" \
-  --output "Viscose Benchmarks Updated.xlsx"
+python3 watcher.pyw --config config.json
 ```
 
-### 运行机制概述
+可选参数：
 
-- **自动 SQL 检测**：脚本会扫描数据库的所有表，优先选择同时包含场景名称与分数字段的表。必要时可以用 `--table` 等参数强制指定。
-- **场景匹配**：将数据库与 Excel 中的场景名称进行大小写与空白符无关的匹配，例如 "Air Angelic"、"air  angelic" 都视为同一键。
-- **写回 Excel**：只会覆盖 "High Score" 列，其他列（公式、格式、排名阈值等）保持不变。
+| 参数 | 作用 |
+| --- | --- |
+| `--debounce` | 临时覆盖配置中的防抖秒数。|
+| `--skip-initial` | 启动时不立刻跑第一次同步。|
+| `--log-level` / `--log-file` | 控制 watcher 的日志输出。|
 
-## 已完成的阶段 1 任务
+> Windows 下可以用 `pythonw watcher.pyw --config config.json` 在后台运行，并配合 `--log-file` 保存日志。
 
-- [x] 安装并记录所需依赖（sqlite3、openpyxl、pandas）。
-- [x] 连接 KovaaK `stats.db` 并查询每个场景的历史最高分。
-- [x] 读取 `Viscose Benchmarks Beta.xlsx` 的场景工作表。
-- [x] 将场景名称与数据库结果匹配，并写入对应的 "High Score" 单元格。
-- [x] 保存更新后的 Excel 文件（可选输出路径）。
+## 常见路径参考
 
-接下来（阶段 2/3）将基于当前脚本继续封装配置、加入文件监控、以及启动器等功能。
+- Windows：`C:/Program Files (x86)/Steam/steamapps/common/KovaaKs FPS Aim Trainer/stats/stats.db`
+- Linux/Steam Deck：`~/.steam/steam/steamapps/common/KovaaKs FPS Aim Trainer/stats/stats.db`
+- Proton/FPSAimTrainer：`~/.steam/steam/steamapps/common/FPSAimTrainer/FPSAimTrainer/stats`
+
+如果既找不到数据库也没有 CSV，脚本会提示需要手动指定路径。
+
+## 当前进度
+
+- [x] 阶段 1：手动脚本（MVP）
+- [x] 阶段 2：JSON 配置、命令行覆盖、watcher 自动同步
+- [ ] 阶段 3：更友好的 UI/打包（后续计划）
+
+欢迎根据自己的习惯扩展配置，或在 `tests/` 中添加新的单元测试来覆盖更多场景。
